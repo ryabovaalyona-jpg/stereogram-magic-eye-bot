@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import unittest
 from unittest.mock import patch
@@ -92,6 +93,16 @@ class ImageTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_http_client_logs_do_not_expose_api_urls(self):
+        self.assertGreaterEqual(
+            logging.getLogger("httpx").getEffectiveLevel(),
+            logging.WARNING,
+        )
+        self.assertGreaterEqual(
+            logging.getLogger("httpcore").getEffectiveLevel(),
+            logging.WARNING,
+        )
+
     def test_missing_token_exits_with_failure(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(SystemExit) as raised:
