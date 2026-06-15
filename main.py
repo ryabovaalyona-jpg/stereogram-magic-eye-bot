@@ -2,12 +2,26 @@
 🔮 Magic Eye Bot v3
 """
 
-import os
+import asyncio
 import io
-import math
-import random
 import logging
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ExifTags
+import math
+import os
+import random
+import sys
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Callable
+
+from PIL import (
+    Image,
+    ImageDraw,
+    ImageFilter,
+    ImageFont,
+    ImageOps,
+    UnidentifiedImageError,
+)
 
 try:
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,48 +29,134 @@ try:
         Application, CommandHandler, MessageHandler,
         CallbackQueryHandler, ConversationHandler, filters
     )
-except ImportError:
-    print("pip install python-telegram-bot Pillow")
-    exit(1)
+except ImportError as exc:
+    print("Install dependencies with: pip install -r requirements.txt", file=sys.stderr)
+    raise SystemExit(1) from exc
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 WAITING_PHOTO = 0
 WAITING_SHAPE = 1
 WAITING_TEXT = 2
-
-user_photos = {}
-user_last_shape = {}
 
 PATTERN_WIDTH = 130
 OUTPUT_WIDTH = 1690
 OUTPUT_HEIGHT = 960
 MAX_SHIFT = 20
 MAX_TEXT_LENGTH = 8
+SESSION_TTL_SECONDS = 60 * 60
+MAX_USER_SESSIONS = 100
 
 
-def fix_orientation(photo):
-    try:
-        exif = photo._getexif()
-        if exif:
-            for tag, value in exif.items():
-                if ExifTags.TAGS.get(tag) == 'Orientation':
-                    if value == 3: photo = photo.rotate(180, expand=True)
-                    elif value == 6: photo = photo.rotate(270, expand=True)
-                    elif value == 8: photo = photo.rotate(90, expand=True)
-    except Exception:
-        pass
-    return photo
+class InvalidImageError(ValueError):
+    """Raised when an uploaded file cannot be decoded as a usable image."""
 
 
-def make_pattern_strip(photo):
-    photo = fix_orientation(photo)
-    pw, ph = photo.size
-    crop_size = min(pw, ph)
-    crop_left = (pw - crop_size) // 2
+@dataclass
+class UserSession:
+    pattern_tile: Image.Image
+    last_shape: str | None = None
+    expires_at: float = 0.0
+
+
+class SessionStore:
+    """Small in-memory LRU store with sliding expiration."""
+
+    def __init__(
+        self,
+        max_users: int = MAX_USER_SESSIONS,
+        ttl_seconds: int = SESSION_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        if max_users < 1:
+            raise ValueError("max_users must be positive")
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        self.max_users = max_users
+        self.ttl_seconds = ttl_seconds
+        self.clock = clock
+        self._sessions: OrderedDict[int, UserSession] = OrderedDict()
+
+    def set(self, user_id: int, pattern_tile: Image.Image) -> UserSession:
+        now = self.clock()
+        self.cleanup(now)
+        self._sessions.pop(user_id, None)
+        session = UserSession(
+            pattern_tile=pattern_tile,
+            expires_at=now + self.ttl_seconds,
+        )
+        self._sessions[user_id] = session
+        while len(self._sessions) > self.max_users:
+            self._sessions.popitem(last=False)
+        return session
+
+    def get(self, user_id: int) -> UserSession | None:
+        now = self.clock()
+        self.cleanup(now)
+        session = self._sessions.get(user_id)
+        if session is None:
+            return None
+        session.expires_at = now + self.ttl_seconds
+        self._sessions.move_to_end(user_id)
+        return session
+
+    def remove(self, user_id: int) -> None:
+        self._sessions.pop(user_id, None)
+
+    def cleanup(self, now: float | None = None) -> int:
+        now = self.clock() if now is None else now
+        expired = [
+            user_id
+            for user_id, session in self._sessions.items()
+            if session.expires_at <= now
+        ]
+        for user_id in expired:
+            self._sessions.pop(user_id, None)
+        return len(expired)
+
+    def __len__(self) -> int:
+        self.cleanup()
+        return len(self._sessions)
+
+
+sessions = SessionStore()
+
+
+def prepare_pattern_tile(photo: Image.Image) -> Image.Image:
+    photo = ImageOps.exif_transpose(photo).convert("RGB")
+    width, height = photo.size
+    crop_size = min(width, height)
+    crop_left = (width - crop_size) // 2
     face_crop = photo.crop((crop_left, 0, crop_left + crop_size, crop_size))
-    tile = face_crop.resize((PATTERN_WIDTH, PATTERN_WIDTH), Image.LANCZOS)
-    strip = Image.new('RGB', (PATTERN_WIDTH, OUTPUT_HEIGHT))
+    return face_crop.resize((PATTERN_WIDTH, PATTERN_WIDTH), Image.Resampling.LANCZOS)
+
+
+def decode_pattern_tile(photo_bytes: bytes) -> Image.Image:
+    try:
+        with Image.open(io.BytesIO(photo_bytes)) as photo:
+            photo.load()
+            return prepare_pattern_tile(photo)
+    except (
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+        Image.DecompressionBombError,
+    ) as exc:
+        raise InvalidImageError("Unable to decode uploaded image") from exc
+
+
+def make_pattern_strip(pattern_tile: Image.Image) -> Image.Image:
+    tile = pattern_tile
+    if tile.size != (PATTERN_WIDTH, PATTERN_WIDTH):
+        tile = tile.resize(
+            (PATTERN_WIDTH, PATTERN_WIDTH),
+            Image.Resampling.LANCZOS,
+        )
+    strip = Image.new("RGB", (PATTERN_WIDTH, OUTPUT_HEIGHT))
     y = 0
     while y < OUTPUT_HEIGHT:
         h = min(PATTERN_WIDTH, OUTPUT_HEIGHT - y)
@@ -251,8 +351,25 @@ def _draw_bold_centered(dd, text, cx, cy, font, spacing):
 #  ГЕНЕРАТОР
 # ============================================================
 
-def generate_stereogram(photo, depth_map):
-    strip = make_pattern_strip(photo)
+DEPTH_MAKERS = {
+    "heart": make_depth_heart,
+    "broken_heart": make_depth_broken_heart,
+    "star": make_depth_star,
+    "cat": make_depth_cat,
+    "skull": make_depth_skull,
+}
+
+SHAPE_NAMES = {
+    "heart": "❤️ Сердце",
+    "broken_heart": "💔 Разбитое сердце",
+    "star": "⭐ Звезда",
+    "cat": "🐈 Кот",
+    "skull": "💀 Череп",
+}
+
+
+def generate_stereogram(pattern_tile, depth_map):
+    strip = make_pattern_strip(pattern_tile)
     pp = strip.load()
     dpx = depth_map.load()
 
@@ -278,18 +395,23 @@ def generate_stereogram(photo, depth_map):
     return stereogram
 
 
-def make_hint_image(depth_map, photo):
+def make_hint_image(depth_map, pattern_tile):
     """Подсказка — силуэт поверх фото"""
-    strip = make_pattern_strip(photo)
-    tile = strip.crop((0, 0, PATTERN_WIDTH, PATTERN_WIDTH))
+    tile = pattern_tile
     hint_w = 400
     hint_h = int(hint_w * OUTPUT_HEIGHT / OUTPUT_WIDTH)
     bg = Image.new('RGB', (hint_w, hint_h))
-    tile_small = tile.resize((hint_w // 4, hint_h // 4), Image.LANCZOS)
+    tile_small = tile.resize(
+        (hint_w // 4, hint_h // 4),
+        Image.Resampling.LANCZOS,
+    )
     for y in range(0, hint_h, tile_small.size[1]):
         for x in range(0, hint_w, tile_small.size[0]):
             bg.paste(tile_small, (x, y))
-    depth_small = depth_map.resize((hint_w, hint_h), Image.LANCZOS)
+    depth_small = depth_map.resize(
+        (hint_w, hint_h),
+        Image.Resampling.LANCZOS,
+    )
     overlay = Image.new('RGBA', (hint_w, hint_h), (0, 0, 0, 0))
     dpx = depth_small.load()
     opx = overlay.load()
@@ -303,11 +425,55 @@ def make_hint_image(depth_map, photo):
     return bg.convert('RGB')
 
 
+def render_images(pattern_tile: Image.Image, depth_map: Image.Image) -> tuple[bytes, bytes]:
+    result = generate_stereogram(pattern_tile, depth_map)
+    hint = make_hint_image(depth_map, pattern_tile)
+
+    result_buffer = io.BytesIO()
+    result.save(result_buffer, format="PNG", optimize=True)
+
+    hint_buffer = io.BytesIO()
+    hint.save(hint_buffer, format="PNG", optimize=True)
+
+    return result_buffer.getvalue(), hint_buffer.getvalue()
+
+
+def render_shape_images(pattern_tile: Image.Image, choice: str) -> tuple[bytes, bytes]:
+    depth = DEPTH_MAKERS.get(choice, make_depth_heart)()
+    return render_images(pattern_tile, depth)
+
+
+def render_text_images(pattern_tile: Image.Image, text: str) -> tuple[bytes, bytes]:
+    return render_images(pattern_tile, make_depth_text(text))
+
+
+def normalize_custom_text(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text:
+        raise ValueError("empty")
+    if len(text) > MAX_TEXT_LENGTH:
+        raise ValueError("too_long")
+    return text
+
+
+async def send_generated_images(message, result_bytes: bytes, hint_bytes: bytes, caption: str):
+    with io.BytesIO(result_bytes) as result_buffer:
+        await message.reply_photo(photo=result_buffer, caption=caption)
+
+    with io.BytesIO(hint_bytes) as hint_buffer:
+        await message.reply_document(
+            document=hint_buffer,
+            filename="hint.png",
+            caption="🔍 Подсказка (нажми чтобы открыть)",
+        )
+
+
 # ============================================================
 #  TELEGRAM
 # ============================================================
 
 async def start(update, context):
+    sessions.remove(update.effective_user.id)
     await update.message.reply_text(
         "🔮 *Magic Eye Generator*\n\n"
         "Отправь мне фото — я превращу его в 3D-стереограмму!\n\n"
@@ -340,8 +506,22 @@ async def help_command(update, context):
 async def receive_photo(update, context):
     photo_file = await update.message.photo[-1].get_file()
     photo_bytes = await photo_file.download_as_bytearray()
-    photo = Image.open(io.BytesIO(photo_bytes)).convert('RGB')
-    user_photos[update.effective_user.id] = photo
+    try:
+        pattern_tile = await asyncio.to_thread(
+            decode_pattern_tile,
+            bytes(photo_bytes),
+        )
+    except InvalidImageError:
+        logger.warning(
+            "Rejected invalid image from user_id=%s",
+            update.effective_user.id,
+        )
+        await update.message.reply_text(
+            "Не удалось прочитать это фото. Отправь другое изображение."
+        )
+        return WAITING_PHOTO
+
+    sessions.set(update.effective_user.id, pattern_tile)
 
     keyboard = [
         [
@@ -373,9 +553,11 @@ async def shape_chosen(update, context):
     user_id = update.effective_user.id
     choice = query.data
 
-    photo = user_photos.get(user_id)
-    if not photo:
-        await query.edit_message_text("Сначала отправь фото!")
+    session = sessions.get(user_id)
+    if session is None:
+        await query.edit_message_text(
+            "Фото больше не хранится. Отправь его ещё раз!"
+        )
         return WAITING_PHOTO
 
     if choice == "text":
@@ -386,85 +568,61 @@ async def shape_chosen(update, context):
 
     await query.edit_message_text("🔮 Генерирую...")
 
-    depth_makers = {
-        "heart": make_depth_heart,
-        "broken_heart": make_depth_broken_heart,
-        "star": make_depth_star,
-        "cat": make_depth_cat,
-        "skull": make_depth_skull,
-    }
-    depth = depth_makers.get(choice, make_depth_heart)()
-    result = generate_stereogram(photo, depth)
-
-    # Отправляем стереограмму
-    buf = io.BytesIO()
-    result.save(buf, format='PNG', quality=95)
-    buf.seek(0)
-
-    await query.message.reply_photo(
-        photo=buf,
+    result_bytes, hint_bytes = await asyncio.to_thread(
+        render_shape_images,
+        session.pattern_tile.copy(),
+        choice,
+    )
+    await send_generated_images(
+        query.message,
+        result_bytes,
+        hint_bytes,
         caption=(
             "🔮 Готово! Расфокусируй взгляд 👀\n\n"
             "by @alyonafrost"
-        )
-    )
-
-    # Подсказка — спойлер
-    hint = make_hint_image(depth, photo)
-    hint_buf = io.BytesIO()
-    hint.save(hint_buf, format='PNG')
-    hint_buf.seek(0)
-
-    await query.message.reply_document(
-        document=hint_buf,
-        filename="hint.png",
-        caption="🔍 Подсказка (нажми чтобы открыть)"
+        ),
     )
 
     return WAITING_PHOTO
 
 
 async def receive_text(update, context):
-    text = update.message.text.strip()
-
-    if len(text) > MAX_TEXT_LENGTH:
+    try:
+        text = normalize_custom_text(update.message.text)
+    except ValueError as exc:
+        if str(exc) == "empty":
+            await update.message.reply_text(
+                "Текст не должен быть пустым. Попробуй ещё:"
+            )
+            return WAITING_TEXT
         await update.message.reply_text(
             f"Максимум {MAX_TEXT_LENGTH} символов! Попробуй ещё:"
         )
         return WAITING_TEXT
 
     user_id = update.effective_user.id
-    photo = user_photos.get(user_id)
-    if not photo:
-        await update.message.reply_text("Сначала отправь фото!")
+    session = sessions.get(user_id)
+    if session is None:
+        await update.message.reply_text(
+            "Фото больше не хранится. Отправь его ещё раз!"
+        )
         return WAITING_PHOTO
 
     await update.message.reply_text("🔮 Генерирую...")
 
-    depth = make_depth_text(text)
-    result = generate_stereogram(photo, depth)
-
-    buf = io.BytesIO()
-    result.save(buf, format='PNG', quality=95)
-    buf.seek(0)
-
-    await update.message.reply_photo(
-        photo=buf,
+    result_bytes, hint_bytes = await asyncio.to_thread(
+        render_text_images,
+        session.pattern_tile.copy(),
+        text,
+    )
+    await send_generated_images(
+        update.message,
+        result_bytes,
+        hint_bytes,
         caption=(
             f"🔮 «{text}» — расфокусируй взгляд!\n\n"
             "by @alyonafrost"
-        )
-    )
-
-    hint = make_hint_image(depth, photo)
-    hint_buf = io.BytesIO()
-    hint.save(hint_buf, format='PNG')
-    hint_buf.seek(0)
-
-    await update.message.reply_document(
-        document=hint_buf,
-        filename="hint.png",
-        caption="🔍 Подсказка (нажми чтобы открыть)"
+        ),
     )
 
     return WAITING_PHOTO
@@ -472,126 +630,106 @@ async def receive_text(update, context):
 
 async def random_shape(update, context):
     user_id = update.effective_user.id
-    photo = user_photos.get(user_id)
-    if not photo:
+    session = sessions.get(user_id)
+    if session is None:
         await update.message.reply_text("Сначала отправь фото, потом /random!")
         return WAITING_PHOTO
 
-    depth_makers = {
-        "heart": make_depth_heart,
-        "broken_heart": make_depth_broken_heart,
-        "star": make_depth_star,
-        "cat": make_depth_cat,
-        "skull": make_depth_skull,
-    }
-    shape_names = {
-        "heart": "❤️ Сердце",
-        "broken_heart": "💔 Разбитое сердце",
-        "star": "⭐ Звезда",
-        "cat": "🐈 Кот",
-        "skull": "💀 Череп",
-    }
-    choice = random.choice(list(depth_makers.keys()))
-    user_last_shape[user_id] = choice
-    await update.message.reply_text(f"🎲 Случайная форма: {shape_names[choice]}\n🔮 Генерирую...")
-
-    depth = depth_makers[choice]()
-    result = generate_stereogram(photo, depth)
-
-    buf = io.BytesIO()
-    result.save(buf, format='PNG', quality=95)
-    buf.seek(0)
-
-    await update.message.reply_photo(
-        photo=buf,
-        caption=(
-            f"🔮 Готово! Спрятано: {shape_names[choice]}\n"
-            "Расфокусируй взгляд 👀\n\n"
-            "by @alyonafrost"
-        )
+    choice = random.choice(list(DEPTH_MAKERS))
+    session.last_shape = choice
+    await update.message.reply_text(
+        f"🎲 Случайная форма: {SHAPE_NAMES[choice]}\n🔮 Генерирую..."
     )
 
-    hint = make_hint_image(depth, photo)
-    hint_buf = io.BytesIO()
-    hint.save(hint_buf, format='PNG')
-    hint_buf.seek(0)
-
-    await update.message.reply_document(
-        document=hint_buf,
-        filename="hint.png",
-        caption="🔍 Подсказка (нажми чтобы открыть)"
+    result_bytes, hint_bytes = await asyncio.to_thread(
+        render_shape_images,
+        session.pattern_tile.copy(),
+        choice,
+    )
+    await send_generated_images(
+        update.message,
+        result_bytes,
+        hint_bytes,
+        caption=(
+            f"🔮 Готово! Спрятано: {SHAPE_NAMES[choice]}\n"
+            "Расфокусируй взгляд 👀\n\n"
+            "by @alyonafrost"
+        ),
     )
     return WAITING_PHOTO
 
 
 async def again(update, context):
     user_id = update.effective_user.id
-    photo = user_photos.get(user_id)
-    if not photo:
+    session = sessions.get(user_id)
+    if session is None:
         await update.message.reply_text("Сначала отправь фото!")
         return WAITING_PHOTO
 
-    depth_makers = {
-        "heart": make_depth_heart,
-        "broken_heart": make_depth_broken_heart,
-        "star": make_depth_star,
-        "cat": make_depth_cat,
-        "skull": make_depth_skull,
-    }
-    shape_names = {
-        "heart": "❤️ Сердце",
-        "broken_heart": "💔 Разбитое сердце",
-        "star": "⭐ Звезда",
-        "cat": "🐈 Кот",
-        "skull": "💀 Череп",
-    }
-
-    last = user_last_shape.get(user_id)
-    available = [k for k in depth_makers if k != last]
+    available = [key for key in DEPTH_MAKERS if key != session.last_shape]
     choice = random.choice(available)
-    user_last_shape[user_id] = choice
+    session.last_shape = choice
 
-    await update.message.reply_text(f"🔄 Новая форма: {shape_names[choice]}\n🔮 Генерирую...")
-
-    depth = depth_makers[choice]()
-    result = generate_stereogram(photo, depth)
-
-    buf = io.BytesIO()
-    result.save(buf, format='PNG', quality=95)
-    buf.seek(0)
-
-    await update.message.reply_photo(
-        photo=buf,
-        caption=(
-            f"🔮 Готово! Спрятано: {shape_names[choice]}\n"
-            "Расфокусируй взгляд 👀\n\n"
-            "by @alyonafrost"
-        )
+    await update.message.reply_text(
+        f"🔄 Новая форма: {SHAPE_NAMES[choice]}\n🔮 Генерирую..."
     )
 
-    hint = make_hint_image(depth, photo)
-    hint_buf = io.BytesIO()
-    hint.save(hint_buf, format='PNG')
-    hint_buf.seek(0)
-
-    await update.message.reply_document(
-        document=hint_buf,
-        filename="hint.png",
-        caption="🔍 Подсказка (нажми чтобы открыть)"
+    result_bytes, hint_bytes = await asyncio.to_thread(
+        render_shape_images,
+        session.pattern_tile.copy(),
+        choice,
+    )
+    await send_generated_images(
+        update.message,
+        result_bytes,
+        hint_bytes,
+        caption=(
+            f"🔮 Готово! Спрятано: {SHAPE_NAMES[choice]}\n"
+            "Расфокусируй взгляд 👀\n\n"
+            "by @alyonafrost"
+        ),
     )
     return WAITING_PHOTO
 
 
 async def cancel(update, context):
+    sessions.remove(update.effective_user.id)
     await update.message.reply_text("Пока! 🔮")
     return ConversationHandler.END
 
 
-def main():
-    token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN")
-    if not token:
-        print("❌ Добавь TELEGRAM_BOT_TOKEN в Secrets!")
+async def error_handler(update, context):
+    logger.error(
+        "Unhandled error while processing update",
+        exc_info=context.error,
+    )
+    message = getattr(update, "effective_message", None)
+    if message is None:
         return
+    try:
+        await message.reply_text(
+            "Произошла ошибка. Попробуй ещё раз или отправь /start."
+        )
+    except Exception:
+        logger.exception("Failed to notify user about handler error")
+
+
+def get_bot_token() -> str:
+    token = (
+        os.environ.get("TELEGRAM_BOT_TOKEN")
+        or os.environ.get("BOT_TOKEN")
+        or ""
+    ).strip()
+    if not token:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is required. Add it to Railway Variables."
+        )
+    return token
+
+
+def build_application(token: str) -> Application:
+    if not token.strip():
+        raise ValueError("Bot token must not be empty")
 
     app = Application.builder().token(token).build()
 
@@ -619,7 +757,19 @@ def main():
 
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("help", help_command))
-    print("🔮 Magic Eye Bot v3 запущен!")
+    app.add_error_handler(error_handler)
+    return app
+
+
+def main():
+    try:
+        token = get_bot_token()
+    except RuntimeError as exc:
+        logger.critical("%s", exc)
+        raise SystemExit(1) from exc
+
+    app = build_application(token)
+    logger.info("Magic Eye Bot v3 started")
     app.run_polling()
 
 
